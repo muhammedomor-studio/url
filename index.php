@@ -1,198 +1,413 @@
 <?php
 declare(strict_types=1);
 session_start();
-$config = require __DIR__ . '/config.php';
 
-function h(string $s): string { return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
-function appBase(): string {
-    global $config;
-    if (!empty($config['app_base_url'])) return rtrim((string)$config['app_base_url'], '/');
-    if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && !empty($_SERVER['HTTP_HOST'])) {
-        return rtrim($_SERVER['HTTP_X_FORWARDED_PROTO'], ',') . '://' . $_SERVER['HTTP_HOST'];
-    }
-    if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') return 'https://' . $_SERVER['HTTP_HOST'];
-    return 'https://' . ($_SERVER['HTTP_HOST'] ?? 'localhost');
+/*
+ * Short-Link URL Shortener
+ * Configure all secrets in Render Environment Variables.
+ */
+
+$cfg = [
+    'owner'  => getenv('GH_OWNER') ?: '',
+    'repo'   => getenv('GH_REPO') ?: '',
+    'token'  => getenv('GH_TOKEN') ?: '',
+    'branch' => getenv('GH_BRANCH') ?: 'main',
+    'data'   => getenv('GH_DATA_PATH') ?: 'data/links.json',
+    'api'    => getenv('SHORTENER_API_KEY') ?: '',
+    'admin'  => getenv('ADMIN_PASSWORD') ?: '',
+    'base'   => rtrim(getenv('APP_BASE_URL') ?: '', '/'),
+];
+
+function h(string $s): string {
+    return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
-function ghRequest(array $cfg, string $method, string $url, ?array $body = null): array {
-    if (!function_exists('curl_init')) throw new RuntimeException('cURL extension is not available.');
+function jsonReply(array $data, int $status = 200): never {
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+function configured(): bool {
+    global $cfg;
+    return $cfg['owner'] !== '' && $cfg['repo'] !== '' &&
+        $cfg['token'] !== '' && $cfg['api'] !== '' && $cfg['admin'] !== '';
+}
+function appBase(): string {
+    global $cfg;
+    if ($cfg['base'] !== '') return $cfg['base'];
+    $host = $_SERVER['HTTP_HOST'] ?? '';
+    if (!preg_match('/^[a-zA-Z0-9.-]+(?::[0-9]{1,5})?$/', $host)) {
+        throw new RuntimeException('Set APP_BASE_URL in Render.');
+    }
+    $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ||
+        (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+    return ($https ? 'https://' : 'http://') . $host;
+}
+function githubRequest(string $method, string $path, ?array $body = null): array {
+    global $cfg;
+    $url = 'https://api.github.com/repos/' . rawurlencode($cfg['owner']) . '/' .
+        rawurlencode($cfg['repo']) . '/' . $path;
     $ch = curl_init($url);
-    $headers = ['Accept: application/vnd.github+json', 'X-GitHub-Api-Version: 2022-11-28', 'User-Agent: Short-Link-App'];
-    if (!empty($cfg['github_token']) && $cfg['github_token'] !== 'PASTE_YOUR_GITHUB_TOKEN_HERE') $headers[] = 'Authorization: Bearer ' . $cfg['github_token'];
     curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true, CURLOPT_CUSTOMREQUEST => $method,
-        CURLOPT_HTTPHEADER => $headers, CURLOPT_TIMEOUT => 20,
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT => 25,
+        CURLOPT_HTTPHEADER => [
+            'Accept: application/vnd.github+json',
+            'Authorization: Bearer ' . $cfg['token'],
+            'X-GitHub-Api-Version: 2022-11-28',
+            'User-Agent: Short-Link-URL-Shortener',
+            'Content-Type: application/json',
+        ],
     ]);
     if ($body !== null) {
-        $headers[] = 'Content-Type: application/json';
-        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body, JSON_UNESCAPED_SLASHES));
     }
-    $raw = curl_exec($ch); $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $err = curl_error($ch); curl_close($ch);
-    if ($raw === false) throw new RuntimeException('GitHub connection failed: ' . $err);
+    $raw = curl_exec($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+    curl_close($ch);
+    if ($raw === false) throw new RuntimeException('GitHub connection failed: ' . $error);
     $decoded = json_decode($raw, true);
-    if ($status < 200 || $status >= 300) {
-        $msg = is_array($decoded) ? ($decoded['message'] ?? 'GitHub API error') : 'GitHub API error';
-        throw new RuntimeException("GitHub API ($status): $msg");
-    }
-    return ['status'=>$status, 'data'=>$decoded];
+    return ['status' => $status, 'data' => is_array($decoded) ? $decoded : []];
 }
-function repoFileUrl(array $cfg): string {
-    return 'https://api.github.com/repos/' . rawurlencode($cfg['github_owner']) . '/' . rawurlencode($cfg['github_repo']) . '/contents/' . str_replace('%2F','/',rawurlencode($cfg['github_data_path'])) . '?ref=' . rawurlencode($cfg['github_branch']);
+function githubPath(): string {
+    global $cfg;
+    return 'contents/' . implode('/', array_map('rawurlencode', explode('/', $cfg['data'])));
 }
-function loadLinks(array $cfg): array {
-    $res = ghRequest($cfg, 'GET', repoFileUrl($cfg));
-    $content = base64_decode((string)($res['data']['content'] ?? ''), true);
-    if ($content === false) throw new RuntimeException('GitHub JSON file could not be decoded.');
+function loadLinks(): array {
+    global $cfg;
+    $r = githubRequest('GET', githubPath() . '?ref=' . rawurlencode($cfg['branch']));
+    if ($r['status'] === 404) return ['links' => [], 'sha' => null];
+    if ($r['status'] !== 200) throw new RuntimeException('Cannot read GitHub data file. Check path, branch and token permissions.');
+    $content = base64_decode(str_replace("\n", '', (string)($r['data']['content'] ?? '')), true);
+    if ($content === false) throw new RuntimeException('Invalid data file encoding.');
     $links = json_decode($content, true);
-    return is_array($links) ? $links : [];
+    if (!is_array($links)) throw new RuntimeException('links.json must contain a JSON object.');
+    return ['links' => $links, 'sha' => $r['data']['sha'] ?? null];
 }
-function saveLinks(array $cfg, array $links): void {
-    $url = repoFileUrl($cfg);
-    $current = ghRequest($cfg, 'GET', $url);
-    $content = json_encode($links, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-    $plainUrl = strtok($url, '?');
-    ghRequest($cfg, 'PUT', $plainUrl, [
+function saveLinks(array $links, ?string $sha): void {
+    global $cfg;
+    $body = [
         'message' => 'Update Short-Link data',
-        'content' => base64_encode($content === false ? '{}' : $content),
-        'sha' => $current['data']['sha'] ?? null,
-        'branch' => $cfg['github_branch'],
-    ]);
+        'branch' => $cfg['branch'],
+        'content' => base64_encode(json_encode((object)$links,
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)),
+    ];
+    if ($sha !== null) $body['sha'] = $sha;
+    $r = githubRequest('PUT', githubPath(), $body);
+    if (!in_array($r['status'], [200, 201], true)) {
+        throw new RuntimeException(in_array($r['status'], [409, 422], true)
+            ? 'GitHub update conflict; retry the request.' : 'GitHub save failed; check token permissions and branch.');
+    }
 }
-function validConfig(array $c): bool {
-    return !empty($c['github_owner']) && !empty($c['github_repo'])
-        && !empty($c['github_token']) && !empty($c['api_key'])
-        && !empty($c['admin_password']);
+function validUrl(string $url): bool {
+    if (strlen($url) > 2048 || !filter_var($url, FILTER_VALIDATE_URL)) return false;
+    return in_array(strtolower((string)parse_url($url, PHP_URL_SCHEME)), ['http', 'https'], true);
 }
-function shortUrl(string $code): string { return appBase() . '/' . rawurlencode($code); }
-function jsonResponse(array $data, int $status = 200): never {
-    http_response_code($status); header('Content-Type: application/json; charset=utf-8');
-    echo json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE); exit;
+function validAlias(string $alias): bool {
+    return (bool)preg_match('/^[A-Za-z0-9_-]{3,32}$/', $alias);
 }
-function findCode(array $links, string $code): ?string {
-    foreach ($links as $key => $item) if (strcasecmp((string)$key, $code) === 0) return (string)$key;
-    return null;
+function makeCode(array $links): string {
+    $alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    for ($n = 0; $n < 15; $n++) {
+        $code = '';
+        for ($i = 0; $i < 7; $i++) $code .= $alphabet[random_int(0, strlen($alphabet) - 1)];
+        if (!isset($links[$code])) return $code;
+    }
+    throw new RuntimeException('Could not generate a unique short code.');
+}
+function createLink(string $url, string $alias = '', string $expiry = ''): array {
+    if (!validUrl($url)) throw new InvalidArgumentException('Enter a valid HTTP or HTTPS URL.');
+    $expires = null;
+    if ($expiry !== '') {
+        $dt = DateTimeImmutable::createFromFormat('!Y-m-d', $expiry);
+        if (!$dt || $dt->format('Y-m-d') !== $expiry) throw new InvalidArgumentException('Expiry date must use YYYY-MM-DD.');
+        if ($dt->setTime(23, 59, 59)->getTimestamp() < time()) throw new InvalidArgumentException('Expiry date must be today or later.');
+        $expires = $dt->setTime(23, 59, 59)->format(DateTimeInterface::ATOM);
+    }
+    for ($attempt = 0; $attempt < 3; $attempt++) {
+        $d = loadLinks();
+        $links = $d['links'];
+        $code = $alias !== '' ? $alias : makeCode($links);
+        if ($alias !== '' && !validAlias($alias)) throw new InvalidArgumentException('Alias must be 3–32 letters, numbers, underscore or hyphen.');
+        if (isset($links[$code])) throw new InvalidArgumentException('That alias/code is already taken.');
+        $links[$code] = [
+            'url' => $url,
+            'created_at' => gmdate(DateTimeInterface::ATOM),
+            'expires_at' => $expires,
+            'clicks' => 0,
+        ];
+        try {
+            saveLinks($links, $d['sha']);
+            return ['code' => $code, 'url' => appBase() . '/' . rawurlencode($code)];
+        } catch (RuntimeException $e) {
+            if ($attempt === 2 || !str_contains($e->getMessage(), 'conflict')) throw $e;
+        }
+    }
+    throw new RuntimeException('Please retry.');
+}
+function privateApiAllowed(): bool {
+    global $cfg;
+    $provided = $_SERVER['HTTP_X_API_KEY'] ?? '';
+    return $cfg['api'] !== '' && is_string($provided) && hash_equals($cfg['api'], $provided);
+}
+function adminLoggedIn(): bool { return !empty($_SESSION['admin_logged_in']); }
+function csrfToken(): string {
+    if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(32));
+    return $_SESSION['csrf'];
+}
+function csrfValid(): bool {
+    return isset($_POST['csrf'], $_SESSION['csrf']) && is_string($_POST['csrf']) &&
+        hash_equals($_SESSION['csrf'], $_POST['csrf']);
+}
+function isExpired(array $item): bool {
+    $expiry = $item['expires_at'] ?? null;
+    return is_string($expiry) && $expiry !== '' && strtotime($expiry) !== false && strtotime($expiry) < time();
 }
 
+/* Configuration health is not exposed with secret details. */
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
-$setupReady = validConfig($config);
 
-// Short link redirect
-if ($path !== '/' && !str_starts_with($path, '/admin') && !str_starts_with($path, '/api/')) {
-    $code = trim(rawurldecode(substr($path, 1)), '/');
-    if ($code !== '' && !str_contains($code, '/')) {
-        try {
-            $links = loadLinks($config); $key = findCode($links, $code);
-            if ($key !== null && !empty($links[$key]['url'])) {
-                if (!empty($links[$key]['expires_at']) && strtotime((string)$links[$key]['expires_at']) < time()) {
-                    http_response_code(410); echo 'This short link has expired.'; exit;
-                }
-                $links[$key]['clicks'] = (int)($links[$key]['clicks'] ?? 0) + 1;
-                try { saveLinks($config, $links); } catch (Throwable $e) {}
-                header('Location: ' . $links[$key]['url'], true, 302); exit;
-            }
-        } catch (Throwable $e) {}
-        http_response_code(404); echo 'Short link not found.'; exit;
-    }
+if (!configured()) {
+    http_response_code(503);
+    header('Content-Type: text/plain; charset=utf-8');
+    exit('Short-Link is not configured. Add required Environment Variables in Render.');
 }
 
-// JSON API endpoints
-if (str_starts_with($path, '/api/')) {
-    if (!$setupReady) jsonResponse(['error'=>'Please configure config.php first.'], 503);
-    $auth = $_SERVER['HTTP_X_API_KEY'] ?? ($_POST['api_key'] ?? '');
-    if (!hash_equals((string)$config['api_key'], (string)$auth)) jsonResponse(['error'=>'Unauthorized'], 401);
-    try { $links = loadLinks($config); } catch (Throwable $e) { jsonResponse(['error'=>$e->getMessage()], 502); }
-    if ($path === '/api/v1/shorten' && $method === 'POST') {
-        $input = json_decode(file_get_contents('php://input'), true) ?: $_POST;
-        $url = trim((string)($input['url'] ?? '')); $alias = trim((string)($input['alias'] ?? ''));
-        if (!filter_var($url, FILTER_VALIDATE_URL) || !in_array(strtolower((string)parse_url($url, PHP_URL_SCHEME)), ['http','https'], true)) jsonResponse(['error'=>'A valid http/https URL is required.'], 422);
-        $code = $alias !== '' ? $alias : substr(bin2hex(random_bytes(6)), 0, 8);
-        if (!preg_match('/^[A-Za-z0-9_-]{3,40}$/', $code)) jsonResponse(['error'=>'Alias must be 3-40 characters (letters, numbers, _ or -).'], 422);
-        if (findCode($links, $code) !== null) jsonResponse(['error'=>'This alias already exists.'], 409);
-        $links[$code] = ['url'=>$url, 'created_at'=>gmdate('c'), 'expires_at'=>(string)($input['expires_at'] ?? ''), 'clicks'=>0];
-        saveLinks($config, $links);
-        jsonResponse(['code'=>$code, 'name'=>$code, 'short_url'=>shortUrl($code), 'created_at'=>$links[$code]['created_at']], 201);
-    }
-    if ($path === '/api/v1/bulk' && $method === 'POST') {
-        $input = json_decode(file_get_contents('php://input'), true) ?: [];
-        $items = $input['links'] ?? []; if (!is_array($items) || count($items) > 100) jsonResponse(['error'=>'Provide up to 100 links.'], 422);
-        $out = [];
+/* Public API: status and documentation. */
+if ($path === '/api/v1/status') jsonReply(['success' => true, 'service' => 'Short-Link']);
+if ($path === '/api/docs') {
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Short-Link API Docs</title><body style="font:16px system-ui;max-width:850px;margin:40px auto;padding:20px;color:#172554"><h1>Short-Link API Documentation</h1><p>Public endpoint: GET /api/v1/status</p><h2>Create a short link</h2><p>POST /api/v1/shorten</p><pre>{"url":"https://example.com","alias":"my-link","expires_at":"2027-12-31"}</pre><p>Header: X-API-Key: YOUR_SHORTENER_API_KEY</p><h2>Bulk create (up to 20)</h2><p>POST /api/v1/bulk</p><pre>{"urls":[{"url":"https://example.com"},{"url":"https://example.org","alias":"example-org"}]}</pre><h2>Statistics</h2><p>GET /api/v1/stats/CODE with X-API-Key</p><p>Keep API keys secret. GitHub API requests are subject to rate limits.</p><p><a href="/">Back to Short-Link</a></p></body></html>';
+    exit;
+}
+
+/* Private API: single and bulk URL creation. */
+if (in_array($path, ['/api/v1/shorten', '/api/v1/bulk'], true)) {
+    if ($method !== 'POST') { header('Allow: POST'); jsonReply(['error' => 'Use POST.'], 405); }
+    if (!privateApiAllowed()) jsonReply(['error' => 'Invalid API key.'], 401);
+    $input = json_decode(file_get_contents('php://input'), true);
+    if (!is_array($input)) jsonReply(['error' => 'Send a JSON object.'], 400);
+    try {
+        if ($path === '/api/v1/shorten') {
+            if (!is_string($input['url'] ?? null)) jsonReply(['error' => 'url is required.'], 400);
+            $made = createLink(trim($input['url']), trim((string)($input['alias'] ?? '')), trim((string)($input['expires_at'] ?? '')));
+            jsonReply(['success' => true] + $made, 201);
+        }
+        $items = $input['urls'] ?? null;
+        if (!is_array($items) || count($items) < 1 || count($items) > 20) jsonReply(['error' => 'Provide 1–20 URLs per bulk request.'], 400);
+        $results = [];
         foreach ($items as $item) {
-            $url = trim((string)($item['url'] ?? '')); $alias = trim((string)($item['alias'] ?? ''));
-            if (!filter_var($url, FILTER_VALIDATE_URL) || !in_array(strtolower((string)parse_url($url, PHP_URL_SCHEME)), ['http','https'], true)) { $out[]=['error'=>'Invalid URL']; continue; }
-            $code = $alias !== '' ? $alias : substr(bin2hex(random_bytes(6)), 0, 8);
-            if (!preg_match('/^[A-Za-z0-9_-]{3,40}$/', $code) || findCode($links, $code) !== null) { $out[]=['error'=>'Invalid or duplicate alias']; continue; }
-            $links[$code]=['url'=>$url,'created_at'=>gmdate('c'),'expires_at'=>(string)($item['expires_at'] ?? ''),'clicks'=>0];
-            $out[]=['code'=>$code,'short_url'=>shortUrl($code)];
-        }
-        saveLinks($config, $links); jsonResponse(['results'=>$out]);
-    }
-    if (preg_match('~^/api/v1/stats/([A-Za-z0-9_-]+)$~', $path, $m)) {
-        $key=findCode($links,$m[1]); if ($key===null) jsonResponse(['error'=>'Not found'],404);
-        jsonResponse(['code'=>$key,'short_url'=>shortUrl($key),'clicks'=>(int)($links[$key]['clicks']??0),'created_at'=>$links[$key]['created_at']??null,'expires_at'=>$links[$key]['expires_at']??null]);
-    }
-    jsonResponse(['error'=>'Unknown API endpoint'],404);
-}
-
-// Admin sign-in and dashboard
-if ($path === '/admin' || $path === '/admin/') {
-    if (!$setupReady) { http_response_code(503); $adminError = 'আগে config.php ফাইলে GitHub token, API key ও admin password বসান।'; }
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_password'])) {
-        if (hash_equals((string)$config['admin_password'], (string)$_POST['admin_password'])) { $_SESSION['sl_admin']=true; header('Location: /admin'); exit; }
-        $adminError='পাসওয়ার্ড সঠিক নয়।';
-    }
-    if (isset($_GET['logout'])) { unset($_SESSION['sl_admin']); header('Location: /admin'); exit; }
-    $adminLinks=[]; $adminLoadError='';
-    if (!empty($_SESSION['sl_admin']) && $setupReady) { try { $adminLinks=loadLinks($config); } catch(Throwable $e) { $adminLoadError=$e->getMessage(); } }
-    ?><!doctype html><html lang="bn"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin · Short-Link</title><style>body{font-family:system-ui;background:#f4f8ff;color:#17233b;margin:0;padding:24px}.panel{max-width:900px;margin:30px auto;background:#ffffffd9;border:1px solid #dbe7fa;border-radius:24px;padding:24px;box-shadow:0 20px 60px #17407a12}input,button{padding:12px;border-radius:12px;border:1px solid #d5e0f2}button{background:#2563eb;color:white;border:0;cursor:pointer}.item{padding:14px;border:1px solid #e1eaf8;border-radius:14px;margin:10px 0;overflow-wrap:anywhere}.muted{color:#71809a}.error{color:#b42318}</style></head><body><div class="panel"><h1>Short-Link Admin</h1><?php if (!empty($_SESSION['sl_admin'])): ?><p><a href="/admin?logout=1">Logout</a> · <a href="/">Home</a></p><p><?=count($adminLinks)?> links saved</p><?php if($adminLoadError):?><p class="error"><?=h($adminLoadError)?></p><?php endif; ?><?php foreach(array_reverse($adminLinks,true) as $code=>$item): ?><div class="item"><strong><?=h((string)$code)?></strong><p><?=h(shortUrl((string)$code))?></p><p class="muted"><?=h((string)($item['url']??''))?></p><p>Clicks: <?= (int)($item['clicks']??0) ?> · Created: <?=h((string)($item['created_at']??''))?></p></div><?php endforeach; ?><?php else: ?><p class="muted">অ্যাডমিন ড্যাশবোর্ডে প্রবেশ করতে পাসওয়ার্ড দিন।</p><?php if(!empty($adminError)):?><p class="error"><?=h($adminError)?></p><?php endif; ?><form method="post"><input type="password" name="admin_password" placeholder="Admin password" required><button>Login</button></form><?php endif; ?></div></body></html><?php exit;
-}
-
-// Main page POST create
-$notice=''; $noticeType='success'; $created=null;
-if ($method === 'POST' && isset($_POST['create_link'])) {
-    if (!$setupReady) { $notice='Render-এর Environment Variables (GH_OWNER, GH_REPO, GH_TOKEN, SHORTENER_API_KEY, ADMIN_PASSWORD) সেট করা আছে কি না পরীক্ষা করুন।'; $noticeType='error'; }
-    elseif (!hash_equals((string)$config['api_key'], (string)($_POST['api_key']??''))) { $notice='API key সঠিক নয়।'; $noticeType='error'; }
-    else {
-        $url=trim((string)($_POST['url']??'')); $alias=trim((string)($_POST['alias']??'')); $expires=trim((string)($_POST['expires_at']??''));
-        if (!filter_var($url,FILTER_VALIDATE_URL) || !in_array(strtolower((string)parse_url($url,PHP_URL_SCHEME)),['http','https'],true)) { $notice='সঠিক http/https URL দিন।'; $noticeType='error'; }
-        elseif ($alias!=='' && !preg_match('/^[A-Za-z0-9_-]{3,40}$/',$alias)) { $notice='Alias ৩–৪০ অক্ষর হবে; ইংরেজি অক্ষর, সংখ্যা, _ অথবা - ব্যবহার করুন।'; $noticeType='error'; }
-        else {
+            if (!is_array($item) || !is_string($item['url'] ?? null)) {
+                $results[] = ['success' => false, 'error' => 'Invalid item.']; continue;
+            }
             try {
-                $links=loadLinks($config); $code=$alias!==''?$alias:substr(bin2hex(random_bytes(6)),0,8);
-                if(findCode($links,$code)!==null) throw new RuntimeException('এই Alias আগে থেকেই আছে। অন্য নাম দিন।');
-                $links[$code]=['url'=>$url,'created_at'=>gmdate('c'),'expires_at'=>$expires,'clicks'=>0]; saveLinks($config,$links);
-                $created=['code'=>$code,'short_url'=>shortUrl($code)]; $notice='আপনার Short-Link তৈরি হয়েছে।';
-            } catch(Throwable $e) { $notice='তৈরি করা যায়নি: '.$e->getMessage(); $noticeType='error'; }
+                $results[] = ['success' => true] + createLink(trim($item['url']), trim((string)($item['alias'] ?? '')), trim((string)($item['expires_at'] ?? '')));
+            } catch (Throwable $e) {
+                $results[] = ['success' => false, 'error' => $e->getMessage()];
+            }
         }
+        jsonReply(['success' => true, 'results' => $results], 201);
+    } catch (InvalidArgumentException $e) {
+        jsonReply(['error' => $e->getMessage()], 400);
+    } catch (Throwable $e) {
+        error_log($e->getMessage());
+        jsonReply(['error' => 'Could not process request. Check Render logs.'], 500);
     }
 }
-$links=[]; $loadError='';
-if ($setupReady) { try { $links=loadLinks($config); } catch(Throwable $e) { $loadError=$e->getMessage(); } }
-$links=array_reverse($links,true);
-?><!doctype html><html lang="bn"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f4f8ff"><title>Short-Link · URL Shortener</title><style>
-:root{--blue:#2563eb;--navy:#17233b;--muted:#6d7b94;--line:#dfe8f7;--bg:#f4f8ff}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 5% 0%,#e3edff 0,transparent 34%),radial-gradient(circle at 100% 10%,#e9f6ff 0,transparent 30%),var(--bg);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--navy);min-height:100vh}.wrap{max-width:1040px;margin:auto;padding:24px 16px 60px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:8px 0 30px}.brand{display:flex;align-items:center;gap:12px;font-weight:850;font-size:22px;letter-spacing:-.5px}.logo{width:44px;height:44px;border-radius:15px;display:grid;place-items:center;color:white;background:linear-gradient(135deg,#3478ff,#62c7ff);box-shadow:0 10px 24px #3478ff40;font-size:23px}.pill{border:1px solid #d7e4fa;background:#ffffffa8;padding:9px 13px;border-radius:999px;color:#476181;font-size:12px;font-weight:700}.hero{text-align:center;padding:14px 0 26px}.eyebrow{display:inline-block;color:var(--blue);font-weight:800;font-size:12px;letter-spacing:1.6px;text-transform:uppercase}.hero h1{font-size:clamp(30px,5vw,48px);letter-spacing:-1.6px;margin:12px 0 10px;line-height:1.12}.hero p{color:var(--muted);max-width:600px;margin:0 auto;line-height:1.7}.glass{background:#ffffffc9;border:1px solid #ffffff;box-shadow:0 20px 55px #234a8310,inset 0 1px #ffffff;border-radius:24px;backdrop-filter:blur(18px)}.create{padding:24px;margin-bottom:24px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:18px}.section-head h2{font-size:19px;margin:0;letter-spacing:-.4px}.hint{font-size:12px;color:var(--muted)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.field{display:flex;flex-direction:column;gap:8px}.field.full{grid-column:1/-1}label{font-size:12px;font-weight:800;color:#4a5d79}input{font:inherit;width:100%;padding:13px 14px;border:1px solid #dbe5f3;background:#fff;border-radius:13px;outline:none;color:var(--navy)}input:focus{border-color:#79a6ff;box-shadow:0 0 0 4px #2563eb12}.btn{border:0;border-radius:13px;padding:13px 18px;background:linear-gradient(135deg,#2563eb,#4388ff);color:white;font-weight:800;font-size:14px;cursor:pointer;box-shadow:0 9px 20px #2563eb27}.btn:active{transform:translateY(1px)}.submitrow{display:flex;gap:12px;align-items:center;margin-top:16px;flex-wrap:wrap}.smallnote{font-size:12px;color:var(--muted)}.notice{padding:13px 15px;border-radius:14px;margin:0 0 18px;font-size:13px;font-weight:650}.success{background:#ecfdf3;color:#087443;border:1px solid #b7ebcc}.error{background:#fff1f0;color:#b42318;border:1px solid #ffd0cc}.created{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:16px;border:1px solid #b9e6cb;background:#f0fff5;border-radius:16px;margin-bottom:18px}.created strong{display:block;margin-bottom:6px}.created code{font-size:14px;overflow-wrap:anywhere;color:#087443}.history{padding:24px}.historybar{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:18px}.historybar h2{font-size:20px;margin:0 0 5px}.search{max-width:320px}.stats{display:flex;gap:8px;flex-wrap:wrap}.stat{font-size:12px;color:#5c6e88;border:1px solid var(--line);border-radius:12px;padding:8px 11px;background:#ffffffb8}.list{display:grid;gap:11px}.linkrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:center;padding:16px;border:1px solid #e2eaf6;border-radius:17px;background:#ffffffa8;transition:.2s}.linkrow:hover{border-color:#b9d0fb;box-shadow:0 8px 24px #2b5eaa0b}.linkname{display:flex;align-items:center;gap:10px;min-width:0}.linkicon{width:38px;height:38px;flex-shrink:0;display:grid;place-items:center;border-radius:12px;background:#edf4ff;color:#2563eb;font-size:18px}.linktitle{font-weight:850;font-size:15px;overflow-wrap:anywhere}.short{color:#2563eb;font-size:13px;margin-top:5px;overflow-wrap:anywhere}.meta{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.meta span{font-size:11px;color:#77859b;background:#f1f5fb;padding:5px 8px;border-radius:8px}.actions{display:flex;gap:8px;align-items:center}.copy{border:1px solid #d6e3f8;background:white;color:#2759ad;border-radius:11px;padding:10px 12px;font-size:12px;font-weight:800;cursor:pointer;white-space:nowrap}.copy:hover{background:#eff5ff}.empty{text-align:center;padding:38px 16px;color:var(--muted)}.empty .symbol{font-size:30px;margin-bottom:10px}.footer{text-align:center;color:#8a98ad;font-size:12px;margin-top:22px}.configbox{margin-bottom:18px;padding:16px;border-radius:14px;background:#fff7e8;border:1px solid #f6d9a5;color:#855a10;font-size:13px;line-height:1.65}.hidden{display:none!important}@media(max-width:620px){.wrap{padding:16px 12px 40px}.top{margin-bottom:22px}.hero{padding:8px 0 22px}.create,.history{padding:17px;border-radius:20px}.grid{grid-template-columns:1fr}.field.full{grid-column:auto}.linkrow{grid-template-columns:1fr;gap:12px}.actions{justify-content:flex-end}.search{max-width:none;width:100%}.historybar{align-items:stretch}.historybar .search{order:2}.stats{order:3}.btn{width:100%}.submitrow .smallnote{width:100%}}
-</style></head><body><main class="wrap">
-<header class="top"><div class="brand"><span class="logo">↗</span><span>Short-Link</span></div><div class="pill">Simple · Fast · Reliable</div></header>
-<section class="hero"><span class="eyebrow">URL SHORTENER</span><h1>লম্বা লিংক হোক ছোট</h1><p>সহজে Short-Link তৈরি করুন, আর আপনার আগের তৈরি করা লিংকগুলো এখান থেকেই আবার কপি করুন।</p></section>
-<?php if(!$setupReady): ?><div class="configbox"><strong>Render সেটআপ:</strong> অ্যাপটি আগের Render Environment Variables থেকেই সেটিংস পড়ে। কোনো Secret কোডে লিখবেন না এবং নতুন Environment Variable যোগ করার দরকার নেই।</div><?php endif; ?>
-<section class="glass create"><div class="section-head"><h2>✦ নতুন Short-Link তৈরি করুন</h2><span class="hint">GitHub JSON storage</span></div>
-<?php if($notice): ?><div class="notice <?=$noticeType==='error'?'error':'success'?>"><?=h($notice)?></div><?php endif; ?>
-<?php if($created): ?><div class="created"><div><strong>আপনার নতুন লিংক তৈরি হয়েছে!</strong><code id="newLink"><?=h($created['short_url'])?></code></div><button class="btn" type="button" onclick="copyText(<?=json_encode($created['short_url'])?>,this)">লিংক কপি করুন</button></div><?php endif; ?>
-<form method="post"><input type="hidden" name="create_link" value="1"><div class="grid">
-<div class="field full"><label for="url">মূল URL</label><input id="url" type="url" name="url" placeholder="https://example.com/your-long-link" required></div>
-<div class="field"><label for="alias">আপনার পছন্দের নাম (Alias)</label><input id="alias" name="alias" placeholder="যেমন: my-book অথবা offer2026" minlength="3" maxlength="40"><span class="hint">খালি রাখলে স্বয়ংক্রিয় নাম তৈরি হবে</span></div>
-<div class="field"><label for="expires_at">মেয়াদ শেষ (ঐচ্ছিক)</label><input id="expires_at" type="date" name="expires_at"></div>
-<div class="field full"><label for="api_key">আপনার API Key</label><input id="api_key" type="password" name="api_key" placeholder="config.php-তে সেট করা API key" required autocomplete="off"></div>
-</div><div class="submitrow"><button class="btn" type="submit">＋ Short-Link তৈরি করুন</button><span class="smallnote">আপনার মূল URL ইতিহাসের তালিকায় দেখানো হবে না।</span></div></form></section>
-<section class="glass history"><div class="historybar"><div><h2>আপনার তৈরি করা লিংক</h2><div class="hint">নাম ও Short-Link দেখা যাবে — মূল URL গোপন থাকবে</div></div><input class="search" id="search" type="search" placeholder="নাম দিয়ে খুঁজুন…"><div class="stats"><span class="stat">মোট লিংক: <strong><?=count($links)?></strong></span><span class="stat">মোট ক্লিক: <strong><?=array_sum(array_map(fn($x)=>(int)($x['clicks']??0),$links))?></strong></span></div></div>
-<?php if($loadError): ?><div class="notice error">লিংক লোড করা যায়নি। config.php-এর GitHub সেটিংস এবং data/links.json ফাইল পরীক্ষা করুন।</div><?php endif; ?>
-<div class="list" id="linkList">
-<?php if(!$links && !$loadError): ?><div class="empty"><div class="symbol">↗</div><strong>এখনও কোনো লিংক নেই</strong><p>প্রথম Short-Link তৈরি করলে সেটি এখানে দেখা যাবে।</p></div><?php endif; ?>
-<?php foreach($links as $code=>$item): $su=shortUrl((string)$code); $expired=!empty($item['expires_at']) && strtotime((string)$item['expires_at']) < time(); ?>
-<article class="linkrow" data-search="<?=h(strtolower((string)$code.' '.$su))?>"><div><div class="linkname"><span class="linkicon">↗</span><div style="min-width:0"><div class="linktitle"><?=h((string)$code)?></div><div class="short"><?=h($su)?></div></div></div><div class="meta"><span><?= (int)($item['clicks']??0) ?> ক্লিক</span><span><?=!empty($item['created_at'])?h(date('d M Y',strtotime((string)$item['created_at']))):'তারিখ নেই'?></span><?php if(!empty($item['expires_at'])): ?><span><?=$expired?'মেয়াদ শেষ':'মেয়াদ: '.h((string)$item['expires_at'])?></span><?php endif; ?></div></div><div class="actions"><button class="copy" type="button" onclick="copyText(<?=json_encode($su)?>,this)">⧉ কপি</button></div></article>
-<?php endforeach; ?></div></section><footer class="footer">Short-Link · Clean links, simple sharing <span> · </span><a href="/admin" style="color:inherit">Admin</a></footer></main>
+
+/* Private statistics endpoint. */
+if (preg_match('#^/api/v1/stats/([A-Za-z0-9_-]{3,32})$#', $path, $m)) {
+    if (!privateApiAllowed()) jsonReply(['error' => 'Invalid API key.'], 401);
+    try {
+        $d = loadLinks();
+        if (!isset($d['links'][$m[1]])) jsonReply(['error' => 'Not found.'], 404);
+        jsonReply(['success' => true, 'code' => $m[1], 'data' => $d['links'][$m[1]]]);
+    } catch (Throwable $e) {
+        error_log($e->getMessage());
+        jsonReply(['error' => 'Could not read statistics.'], 500);
+    }
+}
+
+/* Admin logout. */
+if ($path === '/admin/logout') {
+    $_SESSION = [];
+    session_destroy();
+    header('Location: /admin');
+    exit;
+}
+
+/* Admin login. */
+if ($path === '/admin' && $method === 'POST' && isset($_POST['login'])) {
+    if (!csrfValid()) { http_response_code(403); exit('Invalid form token. Refresh and try again.'); }
+    if (hash_equals($cfg['admin'], (string)($_POST['password'] ?? ''))) {
+        session_regenerate_id(true);
+        $_SESSION['admin_logged_in'] = true;
+        header('Location: /admin');
+        exit;
+    }
+    $loginError = 'Incorrect password.';
+}
+if ($path === '/admin' && !adminLoggedIn()) {
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Short-Link Admin Login</title><body style="font:16px system-ui;background:#f2f6ff;padding:24px;color:#172554"><form method="post" style="max-width:420px;margin:60px auto;background:#ffffffdf;padding:28px;border:1px solid white;border-radius:22px;box-shadow:0 20px 60px #17255412"><h1>Short-Link</h1><p>Admin Dashboard Login</p>';
+    if (!empty($loginError)) echo '<p style="color:#b91c1c">' . h($loginError) . '</p>';
+    echo '<input type="hidden" name="csrf" value="' . h(csrfToken()) . '"><input type="password" name="password" placeholder="Admin password" required style="width:100%;padding:12px;box-sizing:border-box;border:1px solid #dbe4f0;border-radius:10px"><button name="login" value="1" style="margin-top:14px;padding:12px;width:100%;border:0;border-radius:10px;background:#4355e8;color:white">Login</button></form></body></html>';
+    exit;
+}
+
+/* Admin dashboard. */
+if ($path === '/admin') {
+    $notice = '';
+    if ($method === 'POST' && isset($_POST['create'])) {
+        if (!csrfValid()) { http_response_code(403); exit('Invalid form token.'); }
+        try {
+            $made = createLink(trim((string)($_POST['url'] ?? '')), trim((string)($_POST['alias'] ?? '')), trim((string)($_POST['expires_at'] ?? '')));
+            $notice = 'Created: ' . $made['url'];
+        } catch (Throwable $e) { $notice = 'Error: ' . $e->getMessage(); }
+    }
+    try { $d = loadLinks(); $links = $d['links']; }
+    catch (Throwable $e) { error_log($e->getMessage()); $links = []; $notice = 'Unable to load links. Check Render Logs.'; }
+    $clicks = array_sum(array_map(fn($v) => (int)($v['clicks'] ?? 0), $links));
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Short-Link Admin</title><style>
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top left,#dbeafe,transparent 50%),#f7f9ff;font:15px system-ui;color:#172554;padding:20px}
+    main{max-width:1050px;margin:auto}.card{background:#ffffffdc;border:1px solid white;border-radius:20px;padding:22px;margin:18px 0;box-shadow:0 12px 40px #1725540b}
+    input,button{font:inherit;padding:12px;border:1px solid #dbe4f0;border-radius:10px}input{width:100%;margin:5px 0 12px}button{background:#4355e8;color:white;border:0;cursor:pointer}
+    a{color:#3547ce;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px;border-bottom:1px solid #e2e8f0;overflow-wrap:anywhere}
+    .stats{display:flex;gap:12px;flex-wrap:wrap}.stats div{background:#eef2ff;padding:15px;border-radius:12px}.muted{color:#64748b}
+    </style><main><p><a href="/">← Website</a> · <a href="/api/docs">API Docs</a> · <a href="/admin/logout">Logout</a></p><h1>Short-Link</h1><p class="muted">Admin Dashboard</p>';
+    if ($notice !== '') echo '<div class="card">' . h($notice) . '</div>';
+    echo '<section class="stats"><div>Total links: <b>' . count($links) . '</b></div><div>Total clicks: <b>' . $clicks . '</b></div></section>
+    <section class="card"><h2>Create a short link</h2><form method="post"><input type="hidden" name="csrf" value="' . h(csrfToken()) . '"><label>Long URL</label><input type="url" name="url" required placeholder="https://example.com"><label>Custom alias (optional)</label><input name="alias" placeholder="my-link"><label>Expiry date (optional)</label><input type="date" name="expires_at"><button name="create" value="1">Create link</button></form></section>
+    <section class="card"><h2>All links</h2><div class="tablewrap"><table><tr><th>Code</th><th>Destination</th><th>Clicks</th><th>Expiry</th><th>Status</th><th>QR</th></tr>';
+    foreach ($links as $code => $item) {
+        $short = appBase() . '/' . rawurlencode((string)$code);
+        $expired = isExpired(is_array($item) ? $item : []);
+        $url = is_array($item) ? (string)($item['url'] ?? '') : '';
+        $count = (int)($item['clicks'] ?? 0);
+        $expiry = (string)($item['expires_at'] ?? 'Never');
+        $qr = 'https://api.qrserver.com/v1/create-qr-code/?size=140x140&data=' . rawurlencode($short);
+        echo '<tr><td>' . h((string)$code) . '</td><td><a target="_blank" rel="noopener noreferrer" href="' . h($url) . '">' . h($url) . '</a><br><a href="' . h($short) . '">' . h($short) . '</a></td><td>' . $count . '</td><td>' . h($expiry ?: 'Never') . '</td><td>' . ($expired ? 'Expired' : 'Active') . '</td><td><a target="_blank" rel="noopener noreferrer" href="' . h($qr) . '">QR</a></td></tr>';
+    }
+    echo '</table></div></section></main></html>';
+    exit;
+}
+
+/* Short-link redirect and click counter. */
+if ($method === 'GET' && preg_match('#^/([A-Za-z0-9_-]{3,32})$#', $path, $m)) {
+    $code = $m[1];
+    try {
+        $d = loadLinks();
+        if (!isset($d['links'][$code]) || !is_array($d['links'][$code])) {
+            http_response_code(404); exit('Short link not found.');
+        }
+        $item = $d['links'][$code];
+        if (isExpired($item)) { http_response_code(410); exit('This short link has expired.'); }
+        $target = (string)($item['url'] ?? '');
+        if (!validUrl($target)) { http_response_code(404); exit('Invalid destination.'); }
+
+        /* Best-effort click counting. High-traffic analytics should use a database. */
+        $d['links'][$code]['clicks'] = (int)($item['clicks'] ?? 0) + 1;
+        try { saveLinks($d['links'], $d['sha']); } catch (Throwable $e) { error_log('Click counter update failed: ' . $e->getMessage()); }
+
+        header('Cache-Control: no-store');
+        header('Location: ' . $target, true, 302);
+        exit;
+    } catch (Throwable $e) {
+        error_log($e->getMessage());
+        http_response_code(503); exit('Temporarily unable to look up this link.');
+    }
+}
+
+/* Home form submission: key is compared but never stored. */
+if ($path === '/' && $method === 'POST') {
+    $provided = (string)($_POST['api_key'] ?? '');
+    if (!hash_equals($cfg['api'], $provided)) {
+        $_SESSION['flash_error'] = 'Invalid API key.';
+    } else {
+        try {
+            $_SESSION['flash_created'] = createLink(
+                trim((string)($_POST['url'] ?? '')),
+                trim((string)($_POST['alias'] ?? '')),
+                trim((string)($_POST['expires_at'] ?? ''))
+            );
+        } catch (Throwable $e) {
+            $_SESSION['flash_error'] = $e instanceof InvalidArgumentException
+                ? $e->getMessage() : 'Could not create link. Check Render logs.';
+            error_log($e->getMessage());
+        }
+    }
+    header('Location: /');
+    exit;
+}
+
+/* Public web interface. */
+if ($path !== '/' || $method !== 'GET') {
+    http_response_code(404); exit('Not found.');
+}
+header('Content-Type: text/html; charset=utf-8');
+$created = null;
+$error = '';
+if (isset($_SESSION['flash_created'])) {
+    $created = $_SESSION['flash_created'];
+    unset($_SESSION['flash_created']);
+}
+if (isset($_SESSION['flash_error'])) {
+    $error = (string)$_SESSION['flash_error'];
+    unset($_SESSION['flash_error']);
+}
+if ($method === 'POST') { /* POST handler is intentionally handled below by the home form route in the next request. */ }
+?>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#f8fbff">
+<title>Short-Link — URL Shortener</title>
+<style>
+:root{color-scheme:light;--ink:#172554;--muted:#64748b;--line:#dbe5f3;--blue:#4355e8}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;padding:24px 15px;background:radial-gradient(ellipse at 10% 8%,#dbeafe 0,transparent 42%),radial-gradient(ellipse at 95% 92%,#e0e7ff 0,transparent 40%),#f8fbff;color:var(--ink);font-family:system-ui,-apple-system,"Noto Sans Bengali",sans-serif;display:flex;align-items:center;justify-content:center}
+.wrap{width:100%;max-width:760px}.brand{text-align:center;margin-bottom:24px}.logo{display:inline-grid;place-items:center;width:58px;height:58px;border-radius:19px;background:linear-gradient(135deg,#60a5fa,#4338ca);color:white;font-size:29px;box-shadow:0 12px 28px #4f46e533}
+h1{font-size:clamp(30px,7vw,44px);margin:12px 0 4px;letter-spacing:-1px}.brand p,.muted{color:var(--muted);line-height:1.7}.card{background:#ffffffd9;border:1px solid #ffffff;border-radius:25px;padding:clamp(20px,5vw,36px);box-shadow:0 22px 65px #17255412;backdrop-filter:blur(18px)}
+label{display:block;margin:17px 0 8px;font-weight:650}input{display:block;width:100%;min-height:50px;padding:13px 14px;border:1px solid var(--line);border-radius:12px;background:#fff;color:var(--ink);font:inherit;outline:none}input:focus{border-color:var(--blue);box-shadow:0 0 0 3px #4f46e51c}
+button,.btn{display:inline-flex;justify-content:center;align-items:center;gap:8px;min-height:49px;padding:12px 18px;border:0;border-radius:12px;background:linear-gradient(135deg,#60a5fa,#4338ca);color:white;font:inherit;font-weight:700;cursor:pointer;text-decoration:none}
+form button{width:100%;margin-top:18px}.notice{padding:14px 16px;margin:16px 0;border-radius:13px;overflow-wrap:anywhere}.success{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46}.failure{background:#fff1f2;border:1px solid #fecdd3;color:#9f1239}
+.features{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:18px}.feature{padding:14px 8px;border:1px solid #e5eaf5;border-radius:14px;text-align:center;background:#ffffffa8}.feature b{display:block;font-size:14px}.feature span{font-size:12px;color:var(--muted)}
+.small{font-size:13px}.result{margin-top:12px;overflow-wrap:anywhere}.result a{color:#3730a3;font-weight:700}.qr{width:140px;height:140px;display:block;margin:14px auto;border-radius:10px}footer{text-align:center;color:var(--muted);font-size:13px;margin:20px 0}footer a{color:#4338ca}
+@media(max-width:480px){.features{grid-template-columns:1fr}.card{border-radius:20px}}
+</style>
+</head>
+<body>
+<main class="wrap">
+<header class="brand"><div class="logo" aria-hidden="true">↗</div><h1>Short-Link</h1><p>Make long URLs short, simple and shareable.</p></header>
+<section class="card">
+<h2>Shorten your URL</h2>
+<p class="muted">Paste your long link below. Optional: choose a custom alias and expiry date.</p>
+<?php if ($created): ?>
+<div class="notice success"><strong>Your short link is ready!</strong><div class="result"><a href="<?= h($created['url']) ?>"><?= h($created['url']) ?></a></div><button type="button" onclick="copyShort()">Copy link</button><input type="hidden" id="shortUrl" value="<?= h($created['url']) ?>"><img class="qr" alt="QR code" src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=<?= rawurlencode($created['url']) ?>"></div>
+<?php endif; ?>
+<?php if ($error !== ''): ?><div class="notice failure"><?= h($error) ?></div><?php endif; ?>
+<form method="post" action="/">
+<label for="url">Long URL</label><input id="url" name="url" type="url" placeholder="https://example.com/a/long/page" required maxlength="2048">
+<label for="alias">Custom alias (optional)</label><input id="alias" name="alias" pattern="[A-Za-z0-9_-]{3,32}" placeholder="my-link">
+<label for="expiry">Expiry date (optional)</label><input id="expiry" name="expires_at" type="date">
+<label for="key">Private API key</label><input id="key" name="api_key" type="password" autocomplete="off" placeholder="Enter your API key" required>
+<button type="submit">✦ Shorten URL</button>
+</form>
+<div class="features"><div class="feature"><b>⚡ Fast</b><span>Short links in seconds</span></div><div class="feature"><b>🔐 Protected</b><span>Private API key</span></div><div class="feature"><b>📊 Stats</b><span>Click counter</span></div></div>
+<p class="muted small">Your links are stored in your configured GitHub repository. GitHub API limits apply.</p>
+</section>
+<footer><a href="/api/docs">API Documentation</a> · <a href="/admin">Admin Dashboard</a><br>Short-Link</footer>
+</main>
 <script>
-async function copyText(text,button){const old=button.textContent;try{await navigator.clipboard.writeText(text)}catch(e){const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove()}button.textContent='✓ কপি হয়েছে';setTimeout(()=>button.textContent=old,1500)}
-document.getElementById('search').addEventListener('input',function(){const q=this.value.trim().toLowerCase();document.querySelectorAll('.linkrow').forEach(row=>row.classList.toggle('hidden',!row.dataset.search.includes(q)))});
-</script></body></html>
+function copyShort(){const el=document.getElementById('shortUrl');if(!el)return;if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(el.value).then(()=>alert('Copied!')).catch(()=>fallbackCopy(el));}else fallbackCopy(el);}
+function fallbackCopy(el){el.type='text';el.select();document.execCommand('copy');el.type='hidden';alert('Copy attempted.');}
+</script>
+</body>
+</html>
