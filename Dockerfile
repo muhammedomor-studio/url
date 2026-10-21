@@ -1,12 +1,9 @@
-FROM php:8.3-cli
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libcurl4-openssl-dev \
+FROM php:8.3-apache
+RUN apt-get update && apt-get install -y --no-install-recommends libcurl4-openssl-dev \
     && docker-php-ext-install curl \
-    && apt-get clean \
+    && a2enmod rewrite \
     && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY index.php /app/index.php
-EXPOSE 10000
-CMD ["sh", "-c", "php -S 0.0.0.0:${PORT:-10000} -t /app"]
+WORKDIR /var/www/html
+COPY . /var/www/html/
+RUN chown -R www-data:www-data /var/www/html
+EXPOSE 80

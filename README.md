@@ -1,58 +1,34 @@
-# Short-Link URL Shortener
+# Short-Link
 
-A PHP URL shortener designed for Render + GitHub Contents API. The JSON data file is stored in your repository.
+A PHP URL shortener with a polished responsive dashboard and GitHub JSON storage. The app is configured in `config.php`, so **no Render Environment Variables are required**.
 
-## Files
-- `index.php` — web UI, redirects, API and admin dashboard
-- `Dockerfile` — PHP runtime for Render
-- `data/links.json` — link data (must exist on the configured branch)
+## Before deployment (one-time setup)
+1. In your GitHub repository `muhammedomor-studio/url`, create a fine-grained Personal Access Token.
+2. Grant access only to this repository and give **Contents: Read and write** permission.
+3. Open `config.php` and replace:
+   - `PASTE_YOUR_GITHUB_TOKEN_HERE` with your token
+   - `CHANGE_THIS_TO_A_LONG_RANDOM_SECRET` with a long random API key
+   - `CHANGE_THIS_ADMIN_PASSWORD` with a strong admin password
+4. Confirm owner `muhammedomor-studio`, repo `url`, branch `main`. Change them in `config.php` if your branch differs.
+5. Ensure `data/links.json` exists in that repository and contains `{}`.
+6. Commit/upload the files to GitHub.
 
-## GitHub setup
-1. Create a repository.
-2. Add `index.php`, `Dockerfile`, and `data/links.json` (`{}`).
-3. Create a fine-grained GitHub token restricted to this repository, with **Contents: Read and write**.
-4. Do not commit tokens or passwords.
+## Render
+- Create a **Web Service** from your GitHub repository.
+- Runtime: **Docker** (Render detects the `Dockerfile`).
+- No environment variables are needed.
+- Deploy. Your short links will use the actual incoming host automatically.
 
-## Render Environment Variables
-- `GH_OWNER` — GitHub username or organization
-- `GH_REPO` — repository name
-- `GH_TOKEN` — fine-grained token
-- `GH_BRANCH` — e.g. `main`
-- `GH_DATA_PATH` — `data/links.json`
-- `SHORTENER_API_KEY` — long, random secret used for private API and web form
-- `ADMIN_PASSWORD` — strong admin password
-- `APP_BASE_URL` — final Render URL, e.g. `https://your-service.onrender.com`
+## Use
+- Visit `/` to create links and see previously created aliases. Original destination URLs are not shown in the public history.
+- Visit `/admin` and enter the admin password to see full destination URLs and details.
+- Each link is `https://your-render-domain/alias`.
+- For API use, send `X-API-Key: your-configured-api-key`:
+  - `POST /api/v1/shorten` JSON `{"url":"https://example.com/long","alias":"my-link"}`
+  - `POST /api/v1/bulk` JSON `{"links":[{"url":"https://example.com","alias":"example"}]}`
+  - `GET /api/v1/stats/my-link`
 
-Deploy as a Docker Web Service. Set `APP_BASE_URL` after Render assigns the service URL, then redeploy.
-
-## Endpoints
-- `GET /api/v1/status` — public health/status
-- `GET /api/docs` — API documentation
-- `POST /api/v1/shorten` — private API, header `X-API-Key`
-- `POST /api/v1/bulk` — private API, up to 20 links per request
-- `GET /api/v1/stats/CODE` — private stats API
-- `GET /CODE` — redirect
-- `/admin` — admin dashboard
-
-### Single create request
-```bash
-curl -X POST "https://YOUR-SERVICE.onrender.com/api/v1/shorten" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: YOUR_SHORTENER_API_KEY" \
-  -d '{"url":"https://example.com","alias":"example","expires_at":"2027-12-31"}'
-```
-
-### Bulk request
-```bash
-curl -X POST "https://YOUR-SERVICE.onrender.com/api/v1/bulk" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: YOUR_SHORTENER_API_KEY" \
-  -d '{"urls":[{"url":"https://example.com"},{"url":"https://example.org","alias":"example-org"}]}'
-```
-
-## Important limitations
-- GitHub Contents API rate limits apply. Each create and best-effort click count writes the JSON file to GitHub.
-- Concurrent updates can conflict; high-traffic use should move link data and click analytics to a database.
-- QR images are fetched from a third-party QR service; the short URL is sent to that service.
-- Public link creation is not enabled; the web form requires the configured private API key.
-- Keep `GH_TOKEN`, `SHORTENER_API_KEY`, and `ADMIN_PASSWORD` private.
+## Security notes
+- Never commit or share your GitHub token publicly. If you have already exposed a real token, revoke it and create a new one.
+- The public page lists aliases, short URLs and click counts only; it does not display destination URLs.
+- GitHub API rate limits apply. This project saves click counts back to GitHub on each redirect.
