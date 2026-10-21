@@ -1,34 +1,31 @@
-# Short-Link
+# Short-Link — Professional UI update
 
-A PHP URL shortener with a polished responsive dashboard and GitHub JSON storage. The app is configured in `config.php`, so **no Render Environment Variables are required**.
+This version keeps the existing Render Environment Variables and GitHub JSON storage. It is intended as a UI refresh; do not replace or rename the environment variables already configured in Render.
 
-## Before deployment (one-time setup)
-1. In your GitHub repository `muhammedomor-studio/url`, create a fine-grained Personal Access Token.
-2. Grant access only to this repository and give **Contents: Read and write** permission.
-3. Open `config.php` and replace:
-   - `PASTE_YOUR_GITHUB_TOKEN_HERE` with your token
-   - `CHANGE_THIS_TO_A_LONG_RANDOM_SECRET` with a long random API key
-   - `CHANGE_THIS_ADMIN_PASSWORD` with a strong admin password
-4. Confirm owner `muhammedomor-studio`, repo `url`, branch `main`. Change them in `config.php` if your branch differs.
-5. Ensure `data/links.json` exists in that repository and contains `{}`.
-6. Commit/upload the files to GitHub.
+## Existing Render Environment Variables
+- `GH_OWNER`
+- `GH_REPO`
+- `GH_TOKEN`
+- `GH_BRANCH` (defaults to `main` if already omitted)
+- `GH_DATA_PATH` (defaults to `data/links.json` if already omitted)
+- `SHORTENER_API_KEY`
+- `ADMIN_PASSWORD` (optional; if it is not already set, the existing `SHORTENER_API_KEY` is used for the admin login)
+- `APP_BASE_URL` (if already configured; otherwise the app derives the public host)
 
-## Render
-- Create a **Web Service** from your GitHub repository.
-- Runtime: **Docker** (Render detects the `Dockerfile`).
-- No environment variables are needed.
-- Deploy. Your short links will use the actual incoming host automatically.
+No secrets are hardcoded in the source. No new variables are required by this UI update. Keep the existing values exactly as they are.
 
-## Use
-- Visit `/` to create links and see previously created aliases. Original destination URLs are not shown in the public history.
-- Visit `/admin` and enter the admin password to see full destination URLs and details.
-- Each link is `https://your-render-domain/alias`.
-- For API use, send `X-API-Key: your-configured-api-key`:
-  - `POST /api/v1/shorten` JSON `{"url":"https://example.com/long","alias":"my-link"}`
-  - `POST /api/v1/bulk` JSON `{"links":[{"url":"https://example.com","alias":"example"}]}`
-  - `GET /api/v1/stats/my-link`
+## Deploy
+Upload/commit the files in this ZIP to the same GitHub repository and let the existing Render Web Service redeploy. Keep the existing Docker runtime and Render Environment Variables.
 
-## Security notes
-- Never commit or share your GitHub token publicly. If you have already exposed a real token, revoke it and create a new one.
-- The public page lists aliases, short URLs and click counts only; it does not display destination URLs.
-- GitHub API rate limits apply. This project saves click counts back to GitHub on each redirect.
+## Features
+- White/blue glassmorphism design responsive for mobile
+- Lists previously created aliases and short URLs without showing destination URLs publicly
+- One-click copy for each short URL
+- Search by alias/name
+- Click counts and expiry information
+- Admin dashboard at `/admin`
+- Existing GitHub Contents API JSON storage
+- API routes: `POST /api/v1/shorten`, `POST /api/v1/bulk`, `GET /api/v1/stats/{code}`
+
+## Security
+Never put GitHub tokens or API secrets into the code. If a token was previously exposed, revoke it and update the existing `GH_TOKEN` variable in Render.

@@ -5,6 +5,8 @@ $config = require __DIR__ . '/config.php';
 
 function h(string $s): string { return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
 function appBase(): string {
+    global $config;
+    if (!empty($config['app_base_url'])) return rtrim((string)$config['app_base_url'], '/');
     if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && !empty($_SERVER['HTTP_HOST'])) {
         return rtrim($_SERVER['HTTP_X_FORWARDED_PROTO'], ',') . '://' . $_SERVER['HTTP_HOST'];
     }
@@ -58,9 +60,9 @@ function saveLinks(array $cfg, array $links): void {
     ]);
 }
 function validConfig(array $c): bool {
-    return !empty($c['github_token']) && $c['github_token'] !== 'PASTE_YOUR_GITHUB_TOKEN_HERE'
-        && !empty($c['api_key']) && $c['api_key'] !== 'CHANGE_THIS_TO_A_LONG_RANDOM_SECRET'
-        && !empty($c['admin_password']) && $c['admin_password'] !== 'CHANGE_THIS_ADMIN_PASSWORD';
+    return !empty($c['github_owner']) && !empty($c['github_repo'])
+        && !empty($c['github_token']) && !empty($c['api_key'])
+        && !empty($c['admin_password']);
 }
 function shortUrl(string $code): string { return appBase() . '/' . rawurlencode($code); }
 function jsonResponse(array $data, int $status = 200): never {
@@ -149,7 +151,7 @@ if ($path === '/admin' || $path === '/admin/') {
 // Main page POST create
 $notice=''; $noticeType='success'; $created=null;
 if ($method === 'POST' && isset($_POST['create_link'])) {
-    if (!$setupReady) { $notice='প্রথমে config.php ফাইলের সেটিংস পূরণ করুন।'; $noticeType='error'; }
+    if (!$setupReady) { $notice='Render-এর Environment Variables (GH_OWNER, GH_REPO, GH_TOKEN, SHORTENER_API_KEY, ADMIN_PASSWORD) সেট করা আছে কি না পরীক্ষা করুন।'; $noticeType='error'; }
     elseif (!hash_equals((string)$config['api_key'], (string)($_POST['api_key']??''))) { $notice='API key সঠিক নয়।'; $noticeType='error'; }
     else {
         $url=trim((string)($_POST['url']??'')); $alias=trim((string)($_POST['alias']??'')); $expires=trim((string)($_POST['expires_at']??''));
@@ -173,7 +175,7 @@ $links=array_reverse($links,true);
 </style></head><body><main class="wrap">
 <header class="top"><div class="brand"><span class="logo">↗</span><span>Short-Link</span></div><div class="pill">Simple · Fast · Reliable</div></header>
 <section class="hero"><span class="eyebrow">URL SHORTENER</span><h1>লম্বা লিংক হোক ছোট</h1><p>সহজে Short-Link তৈরি করুন, আর আপনার আগের তৈরি করা লিংকগুলো এখান থেকেই আবার কপি করুন।</p></section>
-<?php if(!$setupReady): ?><div class="configbox"><strong>একবার সেটআপ করুন:</strong> ZIP-এর <code>config.php</code> ফাইলে GitHub token, API key এবং Admin password বসিয়ে আবার GitHub-এ আপলোড করুন। Render-এ কোনো Environment Variable যোগ করার দরকার নেই।</div><?php endif; ?>
+<?php if(!$setupReady): ?><div class="configbox"><strong>Render সেটআপ:</strong> অ্যাপটি আগের Render Environment Variables থেকেই সেটিংস পড়ে। কোনো Secret কোডে লিখবেন না এবং নতুন Environment Variable যোগ করার দরকার নেই।</div><?php endif; ?>
 <section class="glass create"><div class="section-head"><h2>✦ নতুন Short-Link তৈরি করুন</h2><span class="hint">GitHub JSON storage</span></div>
 <?php if($notice): ?><div class="notice <?=$noticeType==='error'?'error':'success'?>"><?=h($notice)?></div><?php endif; ?>
 <?php if($created): ?><div class="created"><div><strong>আপনার নতুন লিংক তৈরি হয়েছে!</strong><code id="newLink"><?=h($created['short_url'])?></code></div><button class="btn" type="button" onclick="copyText(<?=json_encode($created['short_url'])?>,this)">লিংক কপি করুন</button></div><?php endif; ?>
